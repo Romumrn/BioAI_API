@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+torch
+transformers
+pydantic
+requests
+python-dotenv
+rich
+Pillow

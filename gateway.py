@@ -31,6 +31,11 @@ BACKENDS = {
         "kind": "completions",
         "owned_by": "biomistral",
     },
+    "grover": {
+        "url": "http://localhost:8003",
+        "kind": "embeddings",
+        "owned_by": "poetschlab",
+    },
 }
 
 TOKENS_FILE = "tokens_db.json"          # clés API des utilisateurs finaux de la gateway

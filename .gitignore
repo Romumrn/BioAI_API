@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.venv_nt/
 
 # clés API et bases de quota générées à l'exécution — jamais commit
 tokens_db.json

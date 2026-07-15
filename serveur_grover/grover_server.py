@@ -13,8 +13,8 @@ from transformers import AutoTokenizer, AutoModelForMaskedLM
 
 # ============ CONFIGURATION ============
 
-MODEL_NAME = "nucleotide-transformer-v2-100m-multi-species"
-MODEL_REPO = "InstaDeepAI/nucleotide-transformer-v2-100m-multi-species"
+MODEL_NAME = "grover"
+MODEL_REPO = "PoetschLab/GROVER"
 TOKENS_FILE = "tokens_db.json"
 
 if torch.cuda.is_available():
@@ -24,18 +24,17 @@ elif torch.backends.mps.is_available():
 else:
     DEVICE = "cpu"
 
-# Nucleotide Transformer est un encodeur (masked language model, type ESM),
-# pas un modèle génératif comme Evo. On l'expose donc via /v1/embeddings
-# (comme le fait l'API OpenAI pour ses modèles d'embeddings) plutôt que
-# via /v1/completions, qui n'aurait pas de sens pour ce type d'architecture.
-tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO, trust_remote_code=True)
-model = AutoModelForMaskedLM.from_pretrained(MODEL_REPO, trust_remote_code=True)
+# GROVER est un encodeur BERT (masked language model) entraîné sur le génome
+# humain avec une tokenisation BPE, pas un modèle génératif. Comme Nucleotide
+# Transformer, on l'expose donc via /v1/embeddings plutôt que /v1/completions.
+tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO)
+model = AutoModelForMaskedLM.from_pretrained(MODEL_REPO)
 model.to(DEVICE)
 model.eval()
 
 
 # ============ GESTION DES TOKENS ============
-# (identique à serveur_evo/evo_server.py)
+# (identique à serveur_nucleotide_transformer/nt_server.py)
 
 class TokenManager:
     """Gère les utilisateurs et leur quota de tokens via un fichier JSON."""
@@ -242,8 +241,8 @@ class EmbeddingsResponse(BaseModel):
 # ============ FASTAPI APP ============
 
 app = FastAPI(
-    title="Nucleotide Transformer API",
-    description="API compatible OpenAI pour extraire des embeddings de séquences ADN avec Nucleotide Transformer",
+    title="GROVER API",
+    description="API compatible OpenAI pour extraire des embeddings de séquences ADN avec GROVER",
     version="0.1.0"
 )
 
@@ -301,7 +300,7 @@ def create_embeddings(
         )
 
     try:
-        encoded = tokenizer.batch_encode_plus(
+        encoded = tokenizer(
             sequences,
             return_tensors="pt",
             padding=True,
@@ -395,7 +394,7 @@ async def list_models(authorization: str = Header(None)):
                 "id": MODEL_NAME,
                 "object": "model",
                 "created": 0,
-                "owned_by": "instadeep"
+                "owned_by": "poetschlab"
             }
         ]
     }
@@ -467,7 +466,7 @@ async def root():
         Un dict décrivant l'API et listant ses endpoints disponibles.
     """
     return {
-        "name": "Nucleotide Transformer API",
+        "name": "GROVER API",
         "version": "0.1.0",
         "model": MODEL_NAME,
         "endpoints": {
@@ -477,9 +476,9 @@ async def root():
             "GET /v1/api-keys/status": "Vérifier votre quota",
             "GET /health": "Health check"
         },
-        "docs": "http://localhost:8001/docs"
+        "docs": "http://localhost:8003/docs"
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8003)

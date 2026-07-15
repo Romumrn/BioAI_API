@@ -17,6 +17,11 @@ MODEL_NAME = "grover"
 MODEL_REPO = "PoetschLab/GROVER"
 TOKENS_FILE = "tokens_db.json"
 
+# Fenêtre de contexte du modèle (max_position_embeddings = 512, un BERT-base
+# classique). Au-delà, on préfère un 400 propre à un crash ou un troncage
+# silencieux.
+MAX_CONTEXT_TOKENS = 512
+
 if torch.cuda.is_available():
     DEVICE = "cuda:0"
 elif torch.backends.mps.is_available():
@@ -305,6 +310,21 @@ def create_embeddings(
             return_tensors="pt",
             padding=True,
         )
+
+        seq_length = encoded["input_ids"].shape[1]
+        if seq_length > MAX_CONTEXT_TOKENS:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": f"Input sequence tokenizes to {seq_length} tokens, "
+                                    f"which exceeds the model's context window ({MAX_CONTEXT_TOKENS} tokens).",
+                        "type": "invalid_request_error",
+                        "code": "context_length_exceeded"
+                    }
+                }
+            )
+
         input_ids = encoded["input_ids"].to(DEVICE)
         attention_mask = encoded["attention_mask"].to(DEVICE)
         prompt_tokens = int(attention_mask.sum().item())
@@ -348,6 +368,8 @@ def create_embeddings(
             )
         )
 
+    except HTTPException:
+        raise
     except torch.cuda.OutOfMemoryError:
         raise HTTPException(
             status_code=500,

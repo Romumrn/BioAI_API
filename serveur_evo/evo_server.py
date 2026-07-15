@@ -8,7 +8,7 @@ from typing import Optional, Dict
 import torch
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Package officiel evo-model (pip install evo-model).
 # On renomme la fonction generate() importée en evo_generate pour éviter
@@ -19,6 +19,12 @@ from evo import Evo, generate as evo_generate
 
 MODEL_NAME = "evo-1.5-8k-base"  # nom court attendu par la classe Evo(), pas le repo HF complet
 TOKENS_FILE = "tokens_db.json"
+
+# Fenêtre de contexte du modèle (8k, comme son nom l'indique). Au-delà,
+# StripedHyena part en "illegal memory access" côté CUDA plutôt que de
+# renvoyer une erreur propre — donc on borne nous-mêmes en amont.
+MAX_CONTEXT_TOKENS = 8192
+MAX_TOKENS_LIMIT = 4096
 
 if torch.cuda.is_available():
     DEVICE = "cuda:0"
@@ -223,7 +229,7 @@ class CompletionRequest(BaseModel):
     """Corps de requête pour l'endpoint /v1/completions, format OpenAI."""
     model: str = MODEL_NAME
     prompt: str
-    max_tokens: int = 100        # équivalent OpenAI de l'ancien max_length, mappé sur n_tokens
+    max_tokens: int = Field(default=100, gt=0, le=MAX_TOKENS_LIMIT)  # équivalent OpenAI de l'ancien max_length, mappé sur n_tokens
     temperature: float = 0.7
     top_p: float = 0.95
     top_k: int = 4                # paramètre natif d'Evo, absent du schéma OpenAI standard
@@ -309,9 +315,21 @@ async def create_completion(
             }
         )
 
-    try:
-        input_length = len(request.prompt)
+    input_length = len(request.prompt)
+    if input_length + request.max_tokens > MAX_CONTEXT_TOKENS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": f"prompt ({input_length} tokens) + max_tokens ({request.max_tokens}) "
+                                f"exceeds the model's context window ({MAX_CONTEXT_TOKENS} tokens).",
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded"
+                }
+            }
+        )
 
+    try:
         # generate() du package evo prend une LISTE de prompts (un par
         # échantillon souhaité) et retourne (sequences, scores) déjà décodés.
         with torch.no_grad():

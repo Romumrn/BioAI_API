@@ -9,7 +9,7 @@ from typing import Optional, Dict
 import requests
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # ============ CONFIGURATION ============
 
@@ -29,6 +29,10 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "cniongolo/biomistral")
 
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8000")
 VLLM_MODEL = os.getenv("VLLM_MODEL", "BioMistral/BioMistral-7B")
+
+# Fenêtre de contexte Ollama par défaut (OLLAMA_CONTEXT_LENGTH=4096). Au-delà,
+# le backend tronque silencieusement ou rame ; on plafonne max_tokens ici.
+MAX_TOKENS_LIMIT = 4096
 
 
 # ============ GESTION DES TOKENS ============
@@ -341,7 +345,7 @@ class CompletionRequest(BaseModel):
     """Corps de requête pour l'endpoint /v1/completions, format OpenAI."""
     model: str = MODEL_NAME
     prompt: str
-    max_tokens: int = 256
+    max_tokens: int = Field(default=256, gt=0, le=MAX_TOKENS_LIMIT)
     temperature: float = 0.7
     top_p: float = 0.95
     n: int = 1                    # nombre de complétions à générer

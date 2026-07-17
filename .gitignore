@@ -8,6 +8,7 @@ venv/
 tokens_db.json
 token.txt
 .internal_key
+.admin_key
 
 # secret du compose (.env.example est le modèle, lui est commité)
 .env

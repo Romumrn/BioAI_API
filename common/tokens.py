@@ -7,11 +7,27 @@ ne voient jamais de clé utilisateur (voir common/internal.py).
 """
 import json
 import secrets
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
 from .errors import invalid_api_key
+
+
+def remaining_tokens(user: Dict) -> Optional[int]:
+    """
+    Quota restant d'un utilisateur.
+
+    Args:
+        user: Données de l'utilisateur telles que stockées dans la base.
+
+    Returns:
+        Le nombre de tokens restants, ou None si le compte est illimité.
+    """
+    if user["quota_tokens"] is None:
+        return None
+    return user["quota_tokens"] - user["used_tokens"]
 
 
 class TokenManager:
@@ -26,6 +42,11 @@ class TokenManager:
         """
         self.filename = filename
         self.db = self._load()
+        # Lire-modifier-écrire le fichier entier à chaque requête n'est atomique
+        # pour personne : deux décomptes concurrents se perdraient l'un l'autre,
+        # et un _save() concurrent d'un autre tronquerait le JSON. Les endpoints
+        # de la gateway sont servis par un pool de threads, d'où ce verrou.
+        self._lock = threading.Lock()
 
     def _load(self) -> Dict:
         """
@@ -45,26 +66,29 @@ class TokenManager:
         with open(self.filename, 'w') as f:
             json.dump(self.db, f, indent=2)
 
-    def create_user(self, email: str, quota_tokens: int = 10000) -> str:
+    def create_user(self, email: str, quota_tokens: Optional[int] = 10000) -> str:
         """
         Crée un nouvel utilisateur avec une clé API générée aléatoirement.
 
         Args:
             email: Email de l'utilisateur.
-            quota_tokens: Quota de tokens alloué à l'utilisateur.
+            quota_tokens: Quota de tokens alloué à l'utilisateur, ou None pour
+                un compte illimité. L'illimité est destiné aux passerelles qui
+                comptent déjà elles-mêmes (OpenGateLLM), pas aux humains.
 
         Returns:
             La clé API générée pour cet utilisateur (préfixe sk-).
         """
         api_key = f"sk-{secrets.token_hex(32)}"
-        self.db[api_key] = {
-            "email": email,
-            "created_at": datetime.now().isoformat(),
-            "quota_tokens": quota_tokens,
-            "used_tokens": 0,
-            "requests": 0
-        }
-        self._save()
+        with self._lock:
+            self.db[api_key] = {
+                "email": email,
+                "created_at": datetime.now().isoformat(),
+                "quota_tokens": quota_tokens,
+                "used_tokens": 0,
+                "requests": 0
+            }
+            self._save()
         return api_key
 
     def verify_key(self, api_key: str) -> Optional[Dict]:
@@ -89,21 +113,24 @@ class TokenManager:
 
         Returns:
             True si la déduction a réussi, False si la clé est invalide
-            ou si le quota restant est insuffisant.
+            ou si le quota restant est insuffisant. Toujours True pour un
+            compte illimité, dont la consommation est enregistrée mais
+            jamais opposée.
         """
-        if api_key not in self.db:
-            return False
+        with self._lock:
+            if api_key not in self.db:
+                return False
 
-        user = self.db[api_key]
-        remaining = user["quota_tokens"] - user["used_tokens"]
+            user = self.db[api_key]
+            remaining = remaining_tokens(user)
 
-        if remaining < tokens_used:
-            return False
+            if remaining is not None and remaining < tokens_used:
+                return False
 
-        user["used_tokens"] += tokens_used
-        user["requests"] += 1
-        self._save()
-        return True
+            user["used_tokens"] += tokens_used
+            user["requests"] += 1
+            self._save()
+            return True
 
     def get_status(self, api_key: str) -> Optional[Dict]:
         """
@@ -115,7 +142,8 @@ class TokenManager:
         Returns:
             Un dict contenant email, quota, tokens utilisés/restants,
             nombre de requêtes et date de création, ou None si la clé
-            est invalide.
+            est invalide. quota_tokens et remaining_tokens valent null
+            pour un compte illimité.
         """
         if api_key not in self.db:
             return None
@@ -125,7 +153,7 @@ class TokenManager:
             "email": user["email"],
             "quota_tokens": user["quota_tokens"],
             "used_tokens": user["used_tokens"],
-            "remaining_tokens": user["quota_tokens"] - user["used_tokens"],
+            "remaining_tokens": remaining_tokens(user),
             "requests_made": user["requests"],
             "created_at": user["created_at"]
         }

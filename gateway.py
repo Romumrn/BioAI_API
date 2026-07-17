@@ -1,11 +1,14 @@
+import json
 import os
+import time
+import uuid
 from datetime import datetime
 from json import JSONDecodeError
-from typing import Optional, Dict
+from typing import List, Optional, Dict
 import requests
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import Depends, FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from common import (
     TokenManager,
@@ -13,6 +16,8 @@ from common import (
     authenticate,
     get_internal_key,
     insufficient_quota,
+    remaining_tokens,
+    require_admin_key,
     server_error,
 )
 
@@ -226,8 +231,8 @@ def handle_request(
     api_key, user = authenticate(token_manager, authorization)
     backend = resolve_backend(payload.get("model"), expected_kind=kind)
 
-    remaining = user["quota_tokens"] - user["used_tokens"]
-    if remaining < MIN_REMAINING[kind]:
+    remaining = remaining_tokens(user)
+    if remaining is not None and remaining < MIN_REMAINING[kind]:
         raise insufficient_quota(f"Quota exceeded. Remaining tokens: {remaining}")
 
     data = forward(backend, f"/v1/{kind}", payload)
@@ -237,6 +242,184 @@ def handle_request(
         raise insufficient_quota("Failed to deduct tokens from quota.")
 
     return data
+
+
+# ============ TRADUCTION CHAT <-> COMPLETIONS ============
+#
+# Nos serveurs de modèles ne parlent que le format "completions" historique
+# (un prompt, du texte en sortie). OpenGateLLM, lui, ne sait appeler qu'un
+# /v1/chat/completions pour tout modèle de type text-generation : son client
+# provider n'a aucune entrée pour les completions legacy. Cette traduction est
+# donc ce qui rend evo et biomistral branchables — sans elle, seuls les
+# modèles d'embeddings le sont.
+
+ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant"}
+
+
+def messages_to_prompt(messages: List[Dict]) -> str:
+    """
+    Aplatit une liste de messages de chat en un prompt unique.
+
+    Le cas d'un seul message utilisateur est traité à part, et ce n'est pas
+    une optimisation : evo est un modèle d'ADN, à qui l'on envoie une séquence
+    brute. Le préfixer d'un "User:" et le suivre d'un "Assistant:" lui ferait
+    continuer une conversation en anglais au lieu de la séquence — le modèle
+    répondrait à côté au lieu d'échouer franchement. Une conversation à
+    plusieurs tours n'a de sens que pour biomistral, et prend alors la forme
+    d'une transcription étiquetée.
+
+    Args:
+        messages: Liste de messages au format OpenAI ({"role", "content"}).
+
+    Returns:
+        Le prompt à envoyer au serveur de modèle.
+
+    Raises:
+        HTTPException: 400 si la liste est vide, mal formée, ou si un contenu
+            n'est pas du texte (les contenus multimodaux ne sont pas gérés :
+            aucun de nos modèles n'est multimodal).
+    """
+    if not isinstance(messages, list) or not messages:
+        raise api_error(
+            400,
+            "Field 'messages' must be a non-empty list of chat messages.",
+            "invalid_request_error",
+            "invalid_request_body",
+        )
+
+    for message in messages:
+        if not isinstance(message, dict) or "content" not in message:
+            raise api_error(
+                400,
+                "Each message must be an object with 'role' and 'content' fields.",
+                "invalid_request_error",
+                "invalid_request_body",
+            )
+        if not isinstance(message["content"], str):
+            raise api_error(
+                400,
+                "Message content must be a string. This gateway serves no "
+                "multimodal model, so content parts are not supported.",
+                "invalid_request_error",
+                "invalid_request_body",
+            )
+
+    if len(messages) == 1 and messages[0].get("role") == "user":
+        return messages[0]["content"]
+
+    transcript = "\n".join(
+        f"{ROLE_LABELS.get(m.get('role'), 'User')}: {m['content']}" for m in messages
+    )
+    return f"{transcript}\n{ROLE_LABELS['assistant']}:"
+
+
+def chat_to_completion_payload(payload: dict) -> dict:
+    """
+    Convertit un corps /v1/chat/completions en corps /v1/completions.
+
+    Args:
+        payload: Corps de requête au format chat.
+
+    Returns:
+        Le corps à relayer au serveur de modèle.
+
+    Raises:
+        HTTPException: 400 si les messages sont absents ou mal formés.
+    """
+    completion_payload = {
+        key: value
+        for key, value in payload.items()
+        # "messages" est remplacé par "prompt" ; "stream" est traité par la
+        # gateway et n'a pas de sens pour un serveur qui ne streame pas.
+        if key not in ("messages", "stream", "stream_options")
+        # Les clients OpenAI envoient volontiers max_tokens: null pour "pas de
+        # limite". Nos serveurs typent max_tokens en int borné : un null les
+        # ferait répondre 422 là où leur propre défaut convient.
+        and value is not None
+    }
+    completion_payload["prompt"] = messages_to_prompt(payload.get("messages"))
+    return completion_payload
+
+
+def completion_to_chat(data: dict) -> dict:
+    """
+    Convertit une réponse /v1/completions en réponse /v1/chat/completions.
+
+    Args:
+        data: Réponse du serveur de modèle, au format completions.
+
+    Returns:
+        La même réponse au format chat.
+    """
+    return {
+        "id": data.get("id", f"chatcmpl-{uuid.uuid4().hex}"),
+        "object": "chat.completion",
+        "created": data.get("created", int(time.time())),
+        "model": data.get("model"),
+        "choices": [
+            {
+                "index": choice.get("index", index),
+                "message": {"role": "assistant", "content": choice.get("text", "")},
+                "finish_reason": choice.get("finish_reason", "stop"),
+            }
+            for index, choice in enumerate(data.get("choices", []))
+        ],
+        "usage": data.get("usage", {}),
+    }
+
+
+def chat_to_sse(chat: dict):
+    """
+    Rejoue une réponse chat complète sous forme d'événements SSE.
+
+    Aucun de nos serveurs de modèles ne streame : la génération est déjà
+    terminée quand cette fonction est appelée. C'est donc du faux streaming —
+    tout le texte arrive en un seul chunk, après le temps de génération
+    complet. Le but n'est pas la latence mais la compatibilité : le playground
+    d'OpenGateLLM demande stream=true par défaut, et refuser le champ y
+    rendrait les modèles inutilisables.
+
+    Args:
+        chat: Réponse complète au format chat.completion.
+
+    Yields:
+        Les lignes SSE, terminées par le sentinel [DONE] attendu des clients
+        OpenAI.
+    """
+    base = {
+        "id": chat["id"],
+        "object": "chat.completion.chunk",
+        "created": chat["created"],
+        "model": chat["model"],
+    }
+
+    for choice in chat["choices"]:
+        content = choice["message"]["content"]
+        delta = {
+            **base,
+            "choices": [
+                {
+                    "index": choice["index"],
+                    "delta": {"role": "assistant", "content": content},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield f"data: {json.dumps(delta)}\n\n"
+
+        stop = {
+            **base,
+            "choices": [
+                {
+                    "index": choice["index"],
+                    "delta": {},
+                    "finish_reason": choice["finish_reason"],
+                }
+            ],
+        }
+        yield f"data: {json.dumps(stop)}\n\n"
+
+    yield "data: [DONE]\n\n"
 
 
 # ============ FASTAPI APP ============
@@ -279,6 +462,41 @@ async def create_completion(request: Request, authorization: str = Header(None))
     payload = await parse_payload(request)
     data = handle_request(authorization, payload, kind="completions")
     return JSONResponse(content=data)
+
+
+@app.post("/v1/chat/completions")
+async def create_chat_completion(request: Request, authorization: str = Header(None)):
+    """
+    Génère une réponse de chat (format OpenAI), routée vers le bon modèle.
+
+    Endpoint de compatibilité : il traduit le format chat vers le format
+    completions que parlent nos serveurs de modèles, et retraduit la réponse.
+    C'est le seul format de génération qu'OpenGateLLM sache appeler.
+
+    Args:
+        request: Requête brute au format chat (messages, max_tokens, stream...).
+        authorization: Header Authorization au format "Bearer <api_key>".
+
+    Returns:
+        La réponse au format chat.completion, ou un flux SSE de
+        chat.completion.chunk si stream=true.
+
+    Raises:
+        HTTPException: 400 si le corps ou les messages sont mal formés ou si le
+            modèle est inconnu, 401 si la clé API est invalide, 429 si le
+            quota est dépassé, 500 en cas d'erreur backend.
+    """
+    payload = await parse_payload(request)
+    stream = bool(payload.get("stream", False))
+
+    data = handle_request(
+        authorization, chat_to_completion_payload(payload), kind="completions"
+    )
+    chat = completion_to_chat(data)
+
+    if stream:
+        return StreamingResponse(chat_to_sse(chat), media_type="text/event-stream")
+    return JSONResponse(content=chat)
 
 
 @app.post("/v1/embeddings")
@@ -332,23 +550,37 @@ async def list_models(authorization: str = Header(None)):
     }
 
 
-@app.post("/v1/api-keys")
-async def create_api_key(email: str, quota_tokens: int = 10000):
+@app.post("/v1/api-keys", dependencies=[Depends(require_admin_key)])
+async def create_api_key(
+    email: str,
+    quota_tokens: Optional[int] = 10000,
+    unlimited: bool = False,
+):
     """
     Crée un nouvel utilisateur et retourne sa clé API pour la gateway.
 
+    Réservé à l'administrateur de la gateway (clé BIOAI_ADMIN_KEY) : cet
+    endpoint distribue le droit de consommer du GPU, et quota_tokens est un
+    paramètre que l'appelant choisit. Ouvert, il annulerait tout l'intérêt
+    des quotas.
+
     Args:
         email: Email de l'utilisateur.
-        quota_tokens: Quota de tokens à allouer.
+        quota_tokens: Quota de tokens à allouer. Ignoré si unlimited est vrai.
+        unlimited: Crée un compte sans plafond. Destiné aux passerelles qui
+            appliquent déjà leurs propres quotas en amont (OpenGateLLM), pas
+            aux utilisateurs humains.
 
     Returns:
-        Un dict contenant l'email, la clé API générée et le quota.
+        Un dict contenant l'email, la clé API générée et le quota (null si
+        le compte est illimité).
     """
-    api_key = token_manager.create_user(email, quota_tokens)
+    quota = None if unlimited else quota_tokens
+    api_key = token_manager.create_user(email, quota)
     return {
         "email": email,
         "api_key": api_key,
-        "quota_tokens": quota_tokens,
+        "quota_tokens": quota,
         "message": "Utilisateur créé. Gardez votre api_key secrète."
     }
 
@@ -408,9 +640,10 @@ async def root():
         "models": list(BACKENDS.keys()),
         "endpoints": {
             "POST /v1/completions": "Générer du texte/une séquence (format OpenAI)",
+            "POST /v1/chat/completions": "Idem au format chat (attendu par OpenGateLLM)",
             "POST /v1/embeddings": "Calculer des embeddings (format OpenAI)",
             "GET /v1/models": "Lister tous les modèles disponibles",
-            "POST /v1/api-keys": "Créer un nouvel utilisateur",
+            "POST /v1/api-keys": "Créer un nouvel utilisateur (clé admin requise)",
             "GET /v1/api-keys/status": "Vérifier votre quota",
             "GET /health": "Health check (gateway + sous-serveurs)"
         },

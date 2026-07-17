@@ -17,16 +17,17 @@ This is a proof of concept. Each model runs in its own FastAPI server, all built
 Users, API keys and quotas exist in exactly one place: the gateway. The model servers know nothing about users and count nothing. This split is deliberate:
 
 - **The gateway** authenticates the caller, checks the quota, forwards the request, and debits the tokens actually consumed. It's the only service that publishes a port.
+- **An admin secret** (`BIOAI_ADMIN_KEY`) guards `POST /v1/api-keys`. Creating a key means handing out the right to burn GPU time, and the caller picks their own `quota_tokens` — so that endpoint can't be open once the gateway is reachable from the internet. It's deliberately *not* the internal secret: the model servers know that one, and they have no business minting user keys.
 - **The model servers** are never reachable by an end user. *How* that's enforced depends on how you run them: bare-metal they bind `127.0.0.1`; under Docker they must bind `0.0.0.0` to be reachable by the gateway from its own network namespace, and instead simply don't publish their port (`expose`, not `ports`). Both are driven by `BIOAI_BIND_HOST`, which defaults to `127.0.0.1`.
 - **A shared internal secret** is what holds in both cases. Model endpoints reject any call that doesn't carry it — including a call carrying a perfectly valid *user* key, since those are meaningless to them. Bare-metal it's a second barrier behind the localhost bind; under Docker it's the only thing standing between a container on the compose network and the models, which is why `docker compose` refuses to start without `BIOAI_INTERNAL_KEY` set.
 
-The secret comes from `BIOAI_INTERNAL_KEY` if set (that's what compose injects into all six containers from `.env`), falling back to a git-ignored `.internal_key` file generated on first run — so a bare-metal server started on its own needs no configuration.
+Both secrets come from the environment if set (that's what compose injects from `.env` — the internal one into all six containers, the admin one into the gateway alone), falling back to a git-ignored `.internal_key` / `.admin_key` file generated on first run — so a bare-metal server started on its own needs no configuration.
 
 Earlier versions duplicated the whole key/quota system into every model server, which meant each one exposed an unauthenticated `POST /v1/api-keys` on `0.0.0.0` — anyone able to reach the port could mint themselves an unlimited key and bypass the gateway entirely. The shared code now lives in [`common/`](common/), and only the gateway has an authentication surface at all.
 
 We're open to adding pretty much any model useful for bio/genomics, as long as we can get it running somewhere. For now, we've started with five models chosen to cover fairly different cases:
 
-- **[Evo](serveur_evo/)** — a generative model (StripedHyena) that produces DNA sequences token by token, a bit like a text LLM but for DNA. Exposed via `/v1/completions`.
+- **[Evo](serveur_evo/)** — a generative model (StripedHyena) that produces DNA sequences token by token, a bit like a text LLM but for DNA. Exposed via `/v1/completions` (and `/v1/chat/completions`, see below).
 - **[Nucleotide Transformer](serveur_nucleotide_transformer/)** — unlike Evo, this one isn't generative: it's a BERT-style encoder that produces embeddings from DNA sequences, which can then be reused for classification or analysis. Exposed via `/v1/embeddings`.
 - **[GROVER](serveur_grover/)** — another BERT-style encoder, but trained only on the human genome, with a BPE tokenizer built to reflect the "grammar" of human DNA rather than a fixed k-mer size. Same idea as Nucleotide Transformer (embeddings out, downstream task after), exposed the same way via `/v1/embeddings`.
 - **[DNABERT-2](serveur_dnabert2/)** — a third BERT-style DNA encoder, but multi-species like Nucleotide Transformer, with its own BPE tokenizer (trained across 135 genomes) instead of GROVER's human-only one. Same `/v1/embeddings` shape as the other two, chosen specifically because it isn't redundant with them: different tokenization strategy, different species coverage, and a different loading path (`AutoModel`, not `AutoModelForMaskedLM`, since its custom modeling code doesn't register a masked-LM head — the embeddings server pulls the last hidden state directly from `outputs[0]` instead of using `output_hidden_states=True`).
@@ -39,8 +40,8 @@ For futher information please visit: **[romumrn.github.io/slides_AI_DNA](https:/
 ```
 docker-compose.yml                # the whole stack; only the gateway publishes a port
 Dockerfile                        # gateway image
-.env.example                      # template for the shared internal secret
-gateway.py                        # single entry point: auth + quotas + routing (port 8080, public)
+.env.example                      # template for the internal + admin secrets
+gateway.py                        # single entry point: auth + quotas + routing (127.0.0.1:8080, behind Caddy)
 common/                           # code shared by the gateway and the model servers
 start_all.py                      # bare-metal launcher (model servers + gateway)
 create_user.py                    # creates an API key on the gateway, saves it to token.txt
@@ -70,8 +71,9 @@ Inside each model folder:
 The five models don't agree on much: Evo wants `transformers` 5.2 and `evo-model`, Nucleotide Transformer needs `transformers` <5 for its remote code, DNABERT-2 runs on Python 3.13 with a **CPU** build of torch, and BioMistral needs no torch at all. Each server gets its own image, so none of this leaks into your shell environment.
 
 ```bash
-# one-time: generate the shared internal secret
-echo "BIOAI_INTERNAL_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))')" > .env
+# one-time: generate the two secrets (internal + admin)
+cp .env.example .env
+python3 -c 'import secrets;print(f"BIOAI_INTERNAL_KEY={secrets.token_hex(32)}\nBIOAI_ADMIN_KEY={secrets.token_hex(32)}")' > .env
 
 docker compose up -d
 docker compose ps          # 6 services; only the gateway publishes a port
@@ -79,15 +81,18 @@ curl localhost:8080/health # gateway + every model server
 ```
 
 ```bash
-# create an API key (gateway-side — the only kind of key there is)
-curl -X POST "http://localhost:8080/v1/api-keys?email=me@example.com&quota_tokens=5000"
+# create an API key (gateway-side — the only kind of key there is).
+# create_user.py finds the admin key in .env (or .admin_key) by itself.
+python create_user.py me@example.com 5000
 
 # use it
 curl -X POST http://localhost:8080/v1/completions \
-  -H "Authorization: Bearer sk-..." \
+  -H "Authorization: Bearer $(cat token.txt)" \
   -H "Content-Type: application/json" \
   -d '{"model": "evo-1.5-8k-base", "prompt": "ATGC", "max_tokens": 50}'
 ```
+
+The gateway publishes on `127.0.0.1:8080`, not `0.0.0.0`. It's meant to sit behind a reverse proxy that terminates TLS (see *Exposing the gateway* below); binding it wide would let anyone bypass that proxy, and Docker writes its own iptables rules, so a host firewall won't necessarily save you.
 
 Two things the compose file expects from the host:
 
@@ -143,6 +148,63 @@ curl -X POST http://localhost:8000/v1/completions \
 ```
 
 Nothing is debited from any quota that way — quotas only exist on the gateway.
+
+## Exposing the gateway
+
+The gateway listens on `127.0.0.1:8080`. Caddy terminates TLS and is the only path in from the outside. On `prabi-cloud149.univ-lyon1.fr` it already served a Streamlit app on `/`, so the gateway got a path prefix rather than a new hostname (which would have meant a new DNS record):
+
+```caddyfile
+prabi-cloud149.univ-lyon1.fr {
+   handle_path /bioai/* {      # strips the prefix: /bioai/v1/models -> /v1/models
+      reverse_proxy localhost:8080
+   }
+   handle {
+      reverse_proxy localhost:8501
+   }
+}
+```
+
+So the public base URL is **`https://prabi-cloud149.univ-lyon1.fr/bioai/`** — trailing slash included, and that slash is not decorative. See the OpenGateLLM section below.
+
+## Plugging into OpenGateLLM
+
+[OpenGateLLM](https://github.com/etalab-ia/OpenGateLLM) is an LLM gateway that can put this API behind its own routing, quotas and accounting. It talks to us as a plain OpenAI-compatible provider.
+
+**Why `/v1/chat/completions` exists.** OpenGateLLM's provider client has exactly one entry for generation: `/v1/chat/completions`. The legacy `/v1/completions` format our model servers speak isn't in its endpoint table at all. So the gateway grows a `/v1/chat/completions` that flattens `messages` into a `prompt`, forwards to `/v1/completions`, and converts the answer back. Without it, only the embeddings models would be pluggable.
+
+The flattening treats a lone user message as a raw prompt, deliberately: Evo is a **DNA** model, and wrapping a sequence in `User:` / `Assistant:` would make it continue an English conversation instead of the sequence — answering wrong rather than failing loudly. Multi-turn conversations only make sense for BioMistral, and get a labelled transcript.
+
+`stream: true` is honoured, but it's emulated: no model server here streams, so the whole answer arrives in one SSE chunk after full generation. It exists because OpenGateLLM's playground asks for streaming by default.
+
+**Set-up.** Create a service account with no quota of its own — OpenGateLLM already meters its own users, and double-metering would just mean the whole thing dies at an unpredictable moment:
+
+```bash
+python create_user.py opengatellm@prabi.univ-lyon1.fr --unlimited
+```
+
+Then, one router (model) per model, each with one provider of type `openai`:
+
+```yaml
+models:
+  - name: nucleotide-transformer-v2-100m-multi-species
+    type: text-embeddings-inference     # text-generation for evo / biomistral
+    providers:
+      - type: openai
+        url: https://prabi-cloud149.univ-lyon1.fr/bioai/
+        key: sk-...                     # the --unlimited key above
+        model_name: nucleotide-transformer-v2-100m-multi-species
+```
+
+| Model | OpenGateLLM router `type` |
+|---|---|
+| `nucleotide-transformer-v2-100m-multi-species`, `grover`, `dnabert2-117m` | `text-embeddings-inference` |
+| `evo-1.5-8k-base`, `biomistral-7b` | `text-generation` |
+
+Three things worth knowing, each of which cost an afternoon to find out:
+
+- **The trailing slash on `url` is mandatory.** OpenGateLLM builds request URLs with `urljoin()`, and `urljoin("https://host/bioai", "v1/models")` returns `https://host/v1/models` — the prefix is dropped and the request lands on Streamlit. With the slash it resolves to `/bioai/v1/models`, as intended.
+- **`model_name` must match an `id` in our `GET /v1/models` exactly.** On provider creation OpenGateLLM calls that endpoint and asserts exactly one model matches, otherwise it refuses the provider as unreachable.
+- **Registering an embeddings provider consumes quota.** OpenGateLLM probes `POST /v1/embeddings` with `input: "hello world"` to discover the vector size (512 for Nucleotide Transformer, 768 for GROVER and DNABERT-2). Yes, it sends English prose to a DNA model — it only measures the vector's length, so it doesn't matter.
 
 ## What's next?
 

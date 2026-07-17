@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+torch
+transformers<5
+einops
+triton
+pydantic
+requests
+python-dotenv

@@ -1,0 +1,20 @@
+Some weights of BertModel were not initialized from the model checkpoint at zhihan1996/DNABERT-2-117M and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+INFO:     Started server process [192224]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8004 (Press CTRL+C to quit)
+INFO:     127.0.0.1:37338 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37342 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37358 - "POST /v1/embeddings HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50014 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34788 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:42668 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35186 - "POST /v1/api-keys?email=gateway%40internal&quota_tokens=1000000000000 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35200 - "POST /v1/embeddings HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44808 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44818 - "GET /health HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [192224]

@@ -1,7 +1,12 @@
-fastapi
-uvicorn
-torch
-transformers
-pydantic
-requests
-python-dotenv
+# BERT standard : pas de code custom, donc pas de contrainte forte sur
+# transformers. On aligne sur Nucleotide Transformer pour partager les couches.
+fastapi==0.138.0
+uvicorn==0.49.0
+pydantic==2.13.4
+requests==2.34.2
+
+# torch est déjà installé par le Dockerfile, depuis l'index CUDA/CPU qui va
+# bien (couche partagée entre les images) ; pip le voit alors satisfait ici.
+# La ligne reste pour que `pip install -r requirement.txt` marche en bare-metal.
+torch==2.6.0
+transformers==4.44.2

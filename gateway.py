@@ -1,295 +1,91 @@
-import json
-import secrets
-from pathlib import Path
+import os
 from datetime import datetime
+from json import JSONDecodeError
 from typing import Optional, Dict
 import requests
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from common import (
+    TokenManager,
+    api_error,
+    authenticate,
+    get_internal_key,
+    insufficient_quota,
+    server_error,
+)
+
 # ============ CONFIGURATION ============
 #
 # Registre des modèles disponibles : nom du modèle -> serveur qui le sert.
-# Pour ajouter un modèle, il suffit de démarrer son serveur (voir start_all.py)
-# et de rajouter une entrée ici avec son nom de modèle, son port et son type
-# (completions ou embeddings, selon l'endpoint que le sous-serveur expose).
+# Pour ajouter un modèle, il suffit de démarrer son serveur (voir start_all.py
+# ou docker-compose.yml) et de rajouter une entrée ici avec son nom de modèle,
+# son port et son type (completions ou embeddings, selon l'endpoint que le
+# serveur de modèle expose).
+
+
+def backend_url(name: str, port: int) -> str:
+    """
+    URL d'un serveur de modèle, surchargeable par variable d'environnement.
+
+    Le défaut vise localhost : c'est le cas bare-metal (start_all.py), où
+    tout tourne sur la même machine. Sous docker compose, chaque serveur est
+    un conteneur distinct joignable par son nom de service, et le compose
+    injecte BIOAI_EVO_URL=http://evo:8000 & co.
+
+    Args:
+        name: Nom court du service (ex: "evo"), qui donne BIOAI_EVO_URL.
+        port: Port du serveur en bare-metal.
+
+    Returns:
+        L'URL de base du serveur de modèle.
+    """
+    return os.getenv(f"BIOAI_{name.upper()}_URL", f"http://localhost:{port}")
+
 
 BACKENDS = {
     "evo-1.5-8k-base": {
-        "url": "http://localhost:8000",
+        "url": backend_url("evo", 8000),
         "kind": "completions",
         "owned_by": "evo",
     },
     "nucleotide-transformer-v2-100m-multi-species": {
-        "url": "http://localhost:8001",
+        "url": backend_url("nt", 8001),
         "kind": "embeddings",
         "owned_by": "instadeep",
     },
     "biomistral-7b": {
-        "url": "http://localhost:8002",
+        "url": backend_url("biomistral", 8002),
         "kind": "completions",
         "owned_by": "biomistral",
     },
     "grover": {
-        "url": "http://localhost:8003",
+        "url": backend_url("grover", 8003),
         "kind": "embeddings",
         "owned_by": "poetschlab",
     },
+    "dnabert2-117m": {
+        "url": backend_url("dnabert2", 8004),
+        "kind": "embeddings",
+        "owned_by": "zhihan1996",
+    },
 }
 
-TOKENS_FILE = "tokens_db.json"          # clés API des utilisateurs finaux de la gateway
-SERVICE_KEYS_FILE = "service_keys.json"  # clés internes gateway -> sous-serveur
+# Clés API des utilisateurs finaux. Le défaut vise le fichier à la racine du
+# repo (bare-metal) ; sous docker compose, la variable pointe vers un volume
+# nommé, sans quoi les utilisateurs disparaîtraient à chaque rebuild d'image.
+TOKENS_FILE = os.getenv("BIOAI_TOKENS_FILE", "tokens_db.json")
 
-
-# ============ GESTION DES TOKENS (utilisateurs finaux) ============
-# (identique aux serveurs de modèles, c'est la seule instance qui compte
-# désormais : c'est ici, et seulement ici, que l'authentification a lieu)
-
-class TokenManager:
-    """Gère les utilisateurs et leur quota de tokens via un fichier JSON."""
-
-    def __init__(self, filename: str):
-        """
-        Initialise le gestionnaire et charge la base existante.
-
-        Args:
-            filename: Chemin du fichier JSON servant de base de données.
-        """
-        self.filename = filename
-        self.db = self._load()
-
-    def _load(self) -> Dict:
-        """
-        Charge la base de tokens depuis le fichier JSON.
-
-        Returns:
-            Le contenu de la base sous forme de dict, ou un dict vide
-            si le fichier n'existe pas encore.
-        """
-        if Path(self.filename).exists():
-            with open(self.filename, 'r') as f:
-                return json.load(f)
-        return {}
-
-    def _save(self):
-        """Sauvegarde l'état actuel de la base dans le fichier JSON."""
-        with open(self.filename, 'w') as f:
-            json.dump(self.db, f, indent=2)
-
-    def create_user(self, email: str, quota_tokens: int = 10000) -> str:
-        """
-        Crée un nouvel utilisateur avec une clé API générée aléatoirement.
-
-        Args:
-            email: Email de l'utilisateur.
-            quota_tokens: Quota de tokens alloué à l'utilisateur.
-
-        Returns:
-            La clé API générée pour cet utilisateur (préfixe sk-).
-        """
-        api_key = f"sk-{secrets.token_hex(32)}"
-        self.db[api_key] = {
-            "email": email,
-            "created_at": datetime.now().isoformat(),
-            "quota_tokens": quota_tokens,
-            "used_tokens": 0,
-            "requests": 0
-        }
-        self._save()
-        return api_key
-
-    def verify_key(self, api_key: str) -> Optional[Dict]:
-        """
-        Vérifie si une clé API existe dans la base.
-
-        Args:
-            api_key: Clé API à vérifier.
-
-        Returns:
-            Les données de l'utilisateur si la clé est valide, sinon None.
-        """
-        return self.db.get(api_key)
-
-    def deduct_tokens(self, api_key: str, tokens_used: int) -> bool:
-        """
-        Déduit des tokens du quota d'un utilisateur.
-
-        Args:
-            api_key: Clé API de l'utilisateur.
-            tokens_used: Nombre de tokens à déduire.
-
-        Returns:
-            True si la déduction a réussi, False si la clé est invalide
-            ou si le quota restant est insuffisant.
-        """
-        if api_key not in self.db:
-            return False
-
-        user = self.db[api_key]
-        remaining = user["quota_tokens"] - user["used_tokens"]
-
-        if remaining < tokens_used:
-            return False
-
-        user["used_tokens"] += tokens_used
-        user["requests"] += 1
-        self._save()
-        return True
-
-    def get_status(self, api_key: str) -> Optional[Dict]:
-        """
-        Récupère le statut d'utilisation d'un utilisateur.
-
-        Args:
-            api_key: Clé API de l'utilisateur.
-
-        Returns:
-            Un dict contenant email, quota, tokens utilisés/restants,
-            nombre de requêtes et date de création, ou None si la clé
-            est invalide.
-        """
-        if api_key not in self.db:
-            return None
-
-        user = self.db[api_key]
-        return {
-            "email": user["email"],
-            "quota_tokens": user["quota_tokens"],
-            "used_tokens": user["used_tokens"],
-            "remaining_tokens": user["quota_tokens"] - user["used_tokens"],
-            "requests_made": user["requests"],
-            "created_at": user["created_at"]
-        }
-
+# La gateway est le seul endroit du projet où vivent les utilisateurs et leur
+# quota. Les serveurs de modèles ne connaissent que le secret interne
+# (common/internal.py) et ne comptent rien.
 token_manager = TokenManager(TOKENS_FILE)
 
-
-def extract_bearer_token(authorization: Optional[str]) -> str:
-    """
-    Extrait la clé API d'un header Authorization au format Bearer.
-
-    Args:
-        authorization: Valeur brute du header Authorization
-            (attendu sous la forme "Bearer sk-...").
-
-    Returns:
-        La clé API extraite.
-
-    Raises:
-        HTTPException: 401 si le header est absent ou mal formé.
-    """
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "error": {
-                    "message": "Missing or malformed Authorization header. "
-                                "Expected format: Bearer <api_key>",
-                    "type": "invalid_request_error",
-                    "code": "invalid_api_key"
-                }
-            }
-        )
-    return authorization.removeprefix("Bearer ").strip()
-
-
-def authenticate(authorization: Optional[str]) -> Dict:
-    """
-    Authentifie une requête à partir du header Authorization.
-
-    Args:
-        authorization: Valeur brute du header Authorization.
-
-    Returns:
-        Les données de l'utilisateur associé à la clé API.
-
-    Raises:
-        HTTPException: 401 si la clé API est manquante ou invalide.
-    """
-    api_key = extract_bearer_token(authorization)
-    user = token_manager.verify_key(api_key)
-    if not user:
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "error": {
-                    "message": "Incorrect API key provided.",
-                    "type": "invalid_request_error",
-                    "code": "invalid_api_key"
-                }
-            }
-        )
-    return user
-
-
-# ============ CLÉS INTERNES GATEWAY -> SOUS-SERVEURS ============
-#
-# Les sous-serveurs (evo_server.py, nt_server.py, biomistral_server.py) ont
-# chacun leur propre authentification. Plutôt que de la leur retirer, la
-# gateway se crée pour chacun une clé de service à quota quasi illimité,
-# qu'elle réutilise pour tous les appels internes. Le quota qui compte pour
-# l'utilisateur final est celui de la gateway (token_manager ci-dessus), pas
-# celui du sous-serveur.
-
-def _load_service_keys() -> Dict[str, str]:
-    """Charge les clés de service déjà générées, si le fichier existe."""
-    if Path(SERVICE_KEYS_FILE).exists():
-        with open(SERVICE_KEYS_FILE, 'r') as f:
-            return json.load(f)
-    return {}
-
-
-def _save_service_keys(keys: Dict[str, str]):
-    """Sauvegarde les clés de service sur disque."""
-    with open(SERVICE_KEYS_FILE, 'w') as f:
-        json.dump(keys, f, indent=2)
-
-
-_service_keys = _load_service_keys()
-
-
-def get_service_key(backend_url: str) -> str:
-    """
-    Récupère (ou crée) la clé de service utilisée par la gateway pour
-    s'authentifier auprès d'un sous-serveur donné.
-
-    Args:
-        backend_url: URL de base du sous-serveur (ex: "http://localhost:8000").
-
-    Returns:
-        La clé API de service pour ce sous-serveur.
-
-    Raises:
-        HTTPException: 500 si le sous-serveur est injoignable.
-    """
-    if backend_url in _service_keys:
-        return _service_keys[backend_url]
-
-    try:
-        resp = requests.post(
-            f"{backend_url}/v1/api-keys",
-            params={"email": "gateway@internal", "quota_tokens": 10**12},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        api_key = resp.json()["api_key"]
-    except requests.RequestException as e:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": {
-                    "message": f"Backend unreachable ({backend_url}): {e}. "
-                                "Le sous-serveur a-t-il bien démarré ?",
-                    "type": "server_error",
-                    "code": "backend_unavailable"
-                }
-            }
-        )
-
-    _service_keys[backend_url] = api_key
-    _save_service_keys(_service_keys)
-    return api_key
+# Quota minimum restant exigé avant d'accepter une requête, par type
+# d'endpoint : le coût réel n'est connu qu'après coup, donc on refuse en
+# amont les comptes manifestement à sec.
+MIN_REMAINING = {"completions": 50, "embeddings": 10}
 
 
 def resolve_backend(model: Optional[str], expected_kind: str) -> Dict:
@@ -310,61 +106,137 @@ def resolve_backend(model: Optional[str], expected_kind: str) -> Dict:
     backend = BACKENDS.get(model)
     if not backend or backend["kind"] != expected_kind:
         available = [name for name, b in BACKENDS.items() if b["kind"] == expected_kind]
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": {
-                    "message": f"Unknown or incompatible model '{model}' for this "
-                                f"endpoint. Available: {available}",
-                    "type": "invalid_request_error",
-                    "code": "model_not_found"
-                }
-            }
+        raise api_error(
+            400,
+            f"Unknown or incompatible model '{model}' for this endpoint. "
+            f"Available: {available}",
+            "invalid_request_error",
+            "model_not_found",
         )
     return backend
 
 
 def forward(backend: Dict, path: str, payload: dict) -> dict:
     """
-    Relaie une requête vers un sous-serveur, avec la clé de service de la
-    gateway, et renvoie le corps de la réponse en cas de succès.
+    Relaie une requête vers un serveur de modèle, avec le secret interne,
+    et renvoie le corps de la réponse en cas de succès.
 
     Args:
         backend: Entrée du registre BACKENDS ciblée.
-        path: Chemin de l'endpoint sur le sous-serveur (ex: "/v1/completions").
+        path: Chemin de l'endpoint sur le serveur de modèle (ex: "/v1/completions").
         payload: Corps JSON à transmettre tel quel.
 
     Returns:
-        Le corps JSON de la réponse du sous-serveur.
+        Le corps JSON de la réponse du serveur de modèle.
 
     Raises:
-        HTTPException: le code renvoyé par le sous-serveur si celui-ci échoue,
-            ou 500 si le sous-serveur est injoignable.
+        HTTPException: le code renvoyé par le serveur de modèle si celui-ci
+            échoue, ou 500 s'il est injoignable.
     """
-    service_key = get_service_key(backend["url"])
     try:
         resp = requests.post(
             f"{backend['url']}{path}",
             json=payload,
-            headers={"Authorization": f"Bearer {service_key}"},
+            headers={"Authorization": f"Bearer {get_internal_key()}"},
             timeout=300,
         )
     except requests.RequestException as e:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": {
-                    "message": f"Backend unreachable ({backend['url']}): {e}",
-                    "type": "server_error",
-                    "code": "backend_unavailable"
-                }
-            }
+        raise server_error(
+            f"Backend unreachable ({backend['url']}): {e}",
+            code="backend_unavailable",
         )
 
     if not resp.ok:
-        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+        # Le corps d'erreur du serveur de modèle est déjà {"detail": ...} :
+        # le relayer tel quel le remettrait dans un second "detail", et
+        # l'appelant recevrait {"detail": {"detail": {"error": ...}}}. On
+        # déballe donc d'un niveau pour que ces erreurs aient exactement la
+        # même forme que celles émises par la gateway elle-même.
+        body = resp.json()
+        detail = body.get("detail", body) if isinstance(body, dict) else body
+        raise HTTPException(status_code=resp.status_code, detail=detail)
 
     return resp.json()
+
+
+async def parse_payload(request: Request) -> dict:
+    """
+    Lit le corps JSON d'une requête et garantit que c'est bien un objet.
+
+    La gateway relaie le corps tel quel au serveur de modèle : elle n'a donc
+    pas de schéma Pydantic pour ces endpoints, et rien ne rattraperait un
+    corps mal formé — l'appelant recevrait un 500 opaque là où le problème
+    est chez lui.
+
+    Args:
+        request: Requête brute.
+
+    Returns:
+        Le corps JSON désérialisé.
+
+    Raises:
+        HTTPException: 400 si le corps n'est pas du JSON valide, ou si c'est
+            du JSON valide mais pas un objet (une liste, un nombre...).
+    """
+    try:
+        payload = await request.json()
+    except JSONDecodeError as e:
+        raise api_error(
+            400,
+            f"Invalid JSON in request body: {e}",
+            "invalid_request_error",
+            "invalid_json",
+        )
+
+    if not isinstance(payload, dict):
+        raise api_error(
+            400,
+            f"Request body must be a JSON object, got {type(payload).__name__}.",
+            "invalid_request_error",
+            "invalid_request_body",
+        )
+
+    return payload
+
+
+def handle_request(
+    authorization: Optional[str],
+    payload: dict,
+    kind: str,
+) -> dict:
+    """
+    Chaîne complète d'une requête modèle : authentification de l'utilisateur,
+    résolution du backend, contrôle de quota, relais, puis décompte.
+
+    C'est ici, et seulement ici, que le quota d'un utilisateur est vérifié et
+    débité : les serveurs de modèles ne comptent rien.
+
+    Args:
+        authorization: Header Authorization au format "Bearer <api_key>".
+        payload: Corps JSON de la requête, relayé tel quel.
+        kind: Type d'endpoint ("completions" ou "embeddings").
+
+    Returns:
+        Le corps JSON de la réponse du serveur de modèle.
+
+    Raises:
+        HTTPException: 401 si la clé API est invalide, 400 si le modèle est
+            inconnu, 429 si le quota est dépassé, 500 en cas d'erreur backend.
+    """
+    api_key, user = authenticate(token_manager, authorization)
+    backend = resolve_backend(payload.get("model"), expected_kind=kind)
+
+    remaining = user["quota_tokens"] - user["used_tokens"]
+    if remaining < MIN_REMAINING[kind]:
+        raise insufficient_quota(f"Quota exceeded. Remaining tokens: {remaining}")
+
+    data = forward(backend, f"/v1/{kind}", payload)
+
+    tokens_used = data.get("usage", {}).get("total_tokens", 0)
+    if not token_manager.deduct_tokens(api_key, tokens_used):
+        raise insufficient_quota("Failed to deduct tokens from quota.")
+
+    return data
 
 
 # ============ FASTAPI APP ============
@@ -392,56 +264,20 @@ async def create_completion(request: Request, authorization: str = Header(None))
     """
     Génère du texte/une séquence (format OpenAI), routé vers le bon modèle.
 
-    Authentifie l'utilisateur via la clé de la gateway, détermine le
-    sous-serveur cible d'après le champ "model" du corps de la requête,
-    relaie la requête telle quelle, puis déduit les tokens consommés du
-    quota de l'utilisateur (et non de celui du sous-serveur).
-
     Args:
-        request: Requête brute (le corps est relayé tel quel au sous-serveur).
+        request: Requête brute (le corps est relayé tel quel au serveur de modèle).
         authorization: Header Authorization au format "Bearer <api_key>".
 
     Returns:
-        La réponse du sous-serveur, au format OpenAI.
+        La réponse du serveur de modèle, au format OpenAI.
 
     Raises:
-        HTTPException: 401 si la clé API est invalide, 400 si le modèle est
-            inconnu, 429 si le quota est dépassé, 500 en cas d'erreur backend.
+        HTTPException: 400 si le corps n'est pas un objet JSON valide ou si le
+            modèle est inconnu, 401 si la clé API est invalide, 429 si le
+            quota est dépassé, 500 en cas d'erreur backend.
     """
-    user = authenticate(authorization)
-    api_key = extract_bearer_token(authorization)
-    payload = await request.json()
-
-    backend = resolve_backend(payload.get("model"), expected_kind="completions")
-
-    remaining = user["quota_tokens"] - user["used_tokens"]
-    if remaining < 50:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error": {
-                    "message": f"Quota exceeded. Remaining tokens: {remaining}",
-                    "type": "insufficient_quota",
-                    "code": "insufficient_quota"
-                }
-            }
-        )
-
-    data = forward(backend, "/v1/completions", payload)
-
-    tokens_used = data.get("usage", {}).get("total_tokens", 0)
-    if not token_manager.deduct_tokens(api_key, tokens_used):
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error": {
-                    "message": "Failed to deduct tokens from quota.",
-                    "type": "insufficient_quota",
-                    "code": "insufficient_quota"
-                }
-            }
-        )
-
+    payload = await parse_payload(request)
+    data = handle_request(authorization, payload, kind="completions")
     return JSONResponse(content=data)
 
 
@@ -450,63 +286,27 @@ async def create_embeddings(request: Request, authorization: str = Header(None))
     """
     Calcule des embeddings (format OpenAI), routé vers le bon modèle.
 
-    Authentifie l'utilisateur via la clé de la gateway, détermine le
-    sous-serveur cible d'après le champ "model" du corps de la requête,
-    relaie la requête telle quelle, puis déduit les tokens consommés du
-    quota de l'utilisateur (et non de celui du sous-serveur).
-
     Args:
-        request: Requête brute (le corps est relayé tel quel au sous-serveur).
+        request: Requête brute (le corps est relayé tel quel au serveur de modèle).
         authorization: Header Authorization au format "Bearer <api_key>".
 
     Returns:
-        La réponse du sous-serveur, au format OpenAI.
+        La réponse du serveur de modèle, au format OpenAI.
 
     Raises:
-        HTTPException: 401 si la clé API est invalide, 400 si le modèle est
-            inconnu, 429 si le quota est dépassé, 500 en cas d'erreur backend.
+        HTTPException: 400 si le corps n'est pas un objet JSON valide ou si le
+            modèle est inconnu, 401 si la clé API est invalide, 429 si le
+            quota est dépassé, 500 en cas d'erreur backend.
     """
-    user = authenticate(authorization)
-    api_key = extract_bearer_token(authorization)
-    payload = await request.json()
-
-    backend = resolve_backend(payload.get("model"), expected_kind="embeddings")
-
-    remaining = user["quota_tokens"] - user["used_tokens"]
-    if remaining < 10:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error": {
-                    "message": f"Quota exceeded. Remaining tokens: {remaining}",
-                    "type": "insufficient_quota",
-                    "code": "insufficient_quota"
-                }
-            }
-        )
-
-    data = forward(backend, "/v1/embeddings", payload)
-
-    tokens_used = data.get("usage", {}).get("total_tokens", 0)
-    if not token_manager.deduct_tokens(api_key, tokens_used):
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error": {
-                    "message": "Failed to deduct tokens from quota.",
-                    "type": "insufficient_quota",
-                    "code": "insufficient_quota"
-                }
-            }
-        )
-
+    payload = await parse_payload(request)
+    data = handle_request(authorization, payload, kind="embeddings")
     return JSONResponse(content=data)
 
 
 @app.get("/v1/models")
 async def list_models(authorization: str = Header(None)):
     """
-    Liste tous les modèles disponibles, tous sous-serveurs confondus.
+    Liste tous les modèles disponibles, tous serveurs de modèles confondus.
 
     Args:
         authorization: Header Authorization au format "Bearer <api_key>".
@@ -517,7 +317,7 @@ async def list_models(authorization: str = Header(None)):
     Raises:
         HTTPException: 401 si la clé API est manquante ou invalide.
     """
-    authenticate(authorization)
+    authenticate(token_manager, authorization)
     return {
         "object": "list",
         "data": [
@@ -567,18 +367,17 @@ async def get_api_key_status(authorization: str = Header(None)):
     Raises:
         HTTPException: 401 si la clé API est manquante ou invalide.
     """
-    user = authenticate(authorization)
-    api_key = extract_bearer_token(authorization)
+    api_key, _ = authenticate(token_manager, authorization)
     return token_manager.get_status(api_key)
 
 
 @app.get("/health")
 async def health():
     """
-    Vérifie l'état de la gateway et de chaque sous-serveur enregistré.
+    Vérifie l'état de la gateway et de chaque serveur de modèle enregistré.
 
     Returns:
-        Un dict avec le statut global et le détail par sous-serveur.
+        Un dict avec le statut global et le détail par serveur de modèle.
     """
     backend_statuses = {}
     for name, backend in BACKENDS.items():

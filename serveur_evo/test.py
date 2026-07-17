@@ -1,35 +1,51 @@
-import requests
+"""
+Test rapide de evo-1.5-8k-base à travers la gateway.
+
+La clé API est celle de la gateway (voir create_user.py à la racine) : elle
+donne accès à tous les modèles, c'est le champ "model" ci-dessous qui choisit
+lequel répond.
+
+Usage:
+    python test.py [sequence] [longueur] [temperature]
+"""
 import sys
+from pathlib import Path
 
-# Paramètres avec valeurs par défaut
-SEQ = sys.argv[1] if len(sys.argv) > 1 else "ATGC"
-LONGUEUR = int(sys.argv[2]) if len(sys.argv) > 2 else 50
-TEMPERATURE = float(sys.argv[3]) if len(sys.argv) > 3 else 0.7
+import requests
 
-# Lire le token
+GATEWAY_URL = "http://localhost:8080"
+MODEL = "evo-1.5-8k-base"
+
+# token.txt vit à la racine du repo, créé par create_user.py
+TOKEN_FILE = Path(__file__).resolve().parent.parent / "token.txt"
 try:
-    token = open("token.txt").read().strip()
+    token = TOKEN_FILE.read_text().strip()
 except FileNotFoundError:
-    print("Fichier token.txt non trouvé")
+    print(f"{{TOKEN_FILE}} non trouvé — lancez d'abord: python create_user.py")
     sys.exit(1)
 
-# Générer
-r = requests.post("http://localhost:8000/v1/completions",
-                  json={
-                      "prompt": SEQ,
-                      "max_tokens": LONGUEUR,
-                      "temperature": TEMPERATURE
-                  },
-                  headers={"Authorization": f"Bearer {token}"})
+PROMPT = sys.argv[1] if len(sys.argv) > 1 else "ATGC"
+MAX_TOKENS = int(sys.argv[2]) if len(sys.argv) > 2 else 50
+TEMPERATURE = float(sys.argv[3]) if len(sys.argv) > 3 else 0.7
+
+r = requests.post(
+    f"{GATEWAY_URL}/v1/completions",
+    json={
+        "model": MODEL,
+        "prompt": PROMPT,
+        "max_tokens": MAX_TOKENS,
+        "temperature": TEMPERATURE,
+    },
+    headers={"Authorization": f"Bearer {token}"},
+)
 
 if r.ok:
     data = r.json()
     completion = data["choices"][0]["text"]
-    remaining_tokens = None  # pas renvoyé directement dans le format OpenAI standard
 
     print(f"\nSéquences:")
-    print(f"   Input : {SEQ}")
-    print(f"   Output: {SEQ}{completion}")
+    print(f"   Input : {PROMPT}")
+    print(f"   Output: {PROMPT}{completion}")
     print(f"\nTokens utilisés: {data['usage']['total_tokens']} "
           f"(prompt: {data['usage']['prompt_tokens']}, "
           f"generation: {data['usage']['completion_tokens']})")

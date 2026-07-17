@@ -1,9 +1,15 @@
-fastapi
-uvicorn
-torch
-transformers<5
-einops
-triton
-pydantic
-requests
-python-dotenv
+# Seul modèle en torch CPU : son code custom choisit un kernel Triton
+# CUDA-only dès que triton est importable, kernel que dnabert2_server.py
+# neutralise hors CUDA. triton doit malgré tout être installé, la 5.x de
+# transformers scannant statiquement les imports du code distant.
+fastapi==0.139.0
+uvicorn==0.51.0
+pydantic==2.13.4
+requests==2.34.2
+
+# torch est déjà installé par le Dockerfile, depuis l'index CPU ; pip le voit
+# alors satisfait ici. La ligne reste pour le bare-metal.
+torch==2.13.0
+transformers==4.57.6
+einops==0.8.2
+triton==3.7.1

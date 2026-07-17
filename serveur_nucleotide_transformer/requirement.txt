@@ -1,7 +1,13 @@
-fastapi
-uvicorn
-torch
-transformers
-pydantic
-requests
-python-dotenv
+# transformers <5 obligatoire : le code custom du modèle (trust_remote_code)
+# ne charge pas avec la 5.x.
+fastapi==0.138.0
+uvicorn==0.49.0
+pydantic==2.13.4
+requests==2.34.2
+
+# torch est déjà installé par le Dockerfile, depuis l'index CUDA/CPU qui va
+# bien (couche partagée entre les images) ; pip le voit alors satisfait ici.
+# La ligne reste pour que `pip install -r requirement.txt` marche en bare-metal.
+torch==2.6.0
+transformers==4.44.2
+einops==0.8.2

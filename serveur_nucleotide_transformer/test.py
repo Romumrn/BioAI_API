@@ -1,20 +1,36 @@
-import requests
+"""
+Test rapide de nucleotide-transformer-v2-100m-multi-species à travers la gateway.
+
+La clé API est celle de la gateway (voir create_user.py à la racine) : elle
+donne accès à tous les modèles, c'est le champ "model" ci-dessous qui choisit
+lequel répond.
+
+Usage:
+    python test.py [sequence]
+"""
 import sys
+from pathlib import Path
 
-# Paramètres avec valeurs par défaut
-SEQ = sys.argv[1] if len(sys.argv) > 1 else "ATTCCGATTCCGATTCCG"
+import requests
 
-# Lire le token
+GATEWAY_URL = "http://localhost:8080"
+MODEL = "nucleotide-transformer-v2-100m-multi-species"
+
+# token.txt vit à la racine du repo, créé par create_user.py
+TOKEN_FILE = Path(__file__).resolve().parent.parent / "token.txt"
 try:
-    token = open("token.txt").read().strip()
+    token = TOKEN_FILE.read_text().strip()
 except FileNotFoundError:
-    print("Fichier token.txt non trouvé")
+    print(f"{{TOKEN_FILE}} non trouvé — lancez d'abord: python create_user.py")
     sys.exit(1)
 
-# Calculer l'embedding
-r = requests.post("http://localhost:8001/v1/embeddings",
-                  json={"input": SEQ},
-                  headers={"Authorization": f"Bearer {token}"})
+SEQ = sys.argv[1] if len(sys.argv) > 1 else "ATTCCGATTCCGATTCCG"
+
+r = requests.post(
+    f"{GATEWAY_URL}/v1/embeddings",
+    json={"model": MODEL, "input": SEQ},
+    headers={"Authorization": f"Bearer {token}"},
+)
 
 if r.ok:
     data = r.json()

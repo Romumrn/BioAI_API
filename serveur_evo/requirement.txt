@@ -1,9 +1,14 @@
-fastapi
-uvicorn
-torch
-transformers
-pydantic
-requests
-python-dotenv
-rich
-Pillow
+# Versions figées sur l'env conda `evo`, le seul jeu validé pour ce modèle.
+fastapi==0.138.0
+uvicorn==0.49.0
+pydantic==2.13.4
+requests==2.34.2
+
+# torch est déjà installé par le Dockerfile, depuis l'index CUDA/CPU qui va
+# bien (couche partagée entre les images) ; pip le voit alors satisfait ici.
+# La ligne reste pour que `pip install -r requirement.txt` marche en bare-metal.
+torch==2.6.0
+transformers==5.2.0
+# evo-model fournit `from evo import Evo, generate` : la dépendance manquait
+# ici, le serveur ne marchait que dans un env où elle était déjà présente.
+evo-model==0.5

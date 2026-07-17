@@ -1,0 +1,171 @@
+# Stack BioAI complète : 5 serveurs de modèles + la gateway.
+#
+#   cp .env.example .env   (puis y mettre un secret, voir README)
+#   docker compose up -d
+#
+# Le point de sécurité de ce fichier : SEULE la gateway publie un port
+# (`ports:`). Les serveurs de modèles se contentent d'`expose:`, donc ils sont
+# joignables par la gateway sur le réseau interne du compose, mais pas depuis
+# l'hôte ni depuis l'extérieur. C'est ce qui remplace le bind 127.0.0.1 du
+# mode bare-metal — un bind 127.0.0.1 dans un conteneur le rendrait
+# injoignable même par la gateway.
+
+x-internal-key: &internal-key
+  # Même secret dans les 6 conteneurs, sans quoi la gateway se ferait
+  # rejeter par les modèles. Vient de .env, jamais commité.
+  BIOAI_INTERNAL_KEY: ${BIOAI_INTERNAL_KEY:?BIOAI_INTERNAL_KEY manquant — voir README (cp .env.example .env)}
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+x-hf-cache: &hf-cache
+  # Cache Hugging Face de l'hôte (~26 Go déjà téléchargés) monté dans les
+  # conteneurs : sans ça, chaque image re-téléchargerait les poids.
+  # Monté en écriture, pas en lecture seule : `trust_remote_code` (NT et
+  # DNABERT-2) écrit le code distant dans ~/.cache/huggingface/modules, et
+  # huggingface_hub pose des verrous dans le cache — un montage :ro les
+  # ferait échouer au chargement.
+  - ${HF_CACHE_DIR:-/data_local/hf_cache}:/root/.cache/huggingface
+
+services:
+  gateway:
+    build:
+      # Contexte = racine du repo : les images ont besoin de common/.
+      context: .
+      dockerfile: Dockerfile
+    image: bioai-gateway
+    ports:
+      - "8080:8080"        # le seul port publié de toute la stack
+    environment:
+      <<: *internal-key
+      BIOAI_TOKENS_FILE: /data/tokens_db.json
+      BIOAI_EVO_URL: http://evo:8000
+      BIOAI_NT_URL: http://nt:8001
+      BIOAI_BIOMISTRAL_URL: http://biomistral:8002
+      BIOAI_GROVER_URL: http://grover:8003
+      BIOAI_DNABERT2_URL: http://dnabert2:8004
+    volumes:
+      # Volume nommé : les utilisateurs et leurs quotas survivent aux rebuilds.
+      - gateway_data:/data
+    depends_on:
+      evo:
+        condition: service_healthy
+      nt:
+        condition: service_healthy
+      biomistral:
+        condition: service_healthy
+      grover:
+        condition: service_healthy
+      dnabert2:
+        condition: service_healthy
+    restart: unless-stopped
+
+  evo:
+    build:
+      context: .
+      dockerfile: serveur_evo/Dockerfile
+    image: bioai-evo
+    expose:
+      - "8000"
+    environment:
+      <<: *internal-key
+    volumes: *hf-cache
+    <<: *gpu
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      # Evo charge plusieurs Go de poids : sans un start_period large, le
+      # conteneur serait déclaré unhealthy avant même d'avoir fini de charger.
+      start_period: 600s
+    restart: unless-stopped
+
+  nt:
+    build:
+      context: .
+      dockerfile: serveur_nucleotide_transformer/Dockerfile
+    image: bioai-nt
+    expose:
+      - "8001"
+    environment:
+      <<: *internal-key
+    volumes: *hf-cache
+    <<: *gpu
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+    restart: unless-stopped
+
+  grover:
+    build:
+      context: .
+      dockerfile: serveur_grover/Dockerfile
+    image: bioai-grover
+    expose:
+      - "8003"
+    environment:
+      <<: *internal-key
+    volumes: *hf-cache
+    <<: *gpu
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+    restart: unless-stopped
+
+  dnabert2:
+    build:
+      context: .
+      dockerfile: serveur_dnabert2/Dockerfile
+    image: bioai-dnabert2
+    expose:
+      - "8004"
+    environment:
+      <<: *internal-key
+    volumes: *hf-cache
+    # Pas de GPU : ce serveur tourne volontairement en torch CPU
+    # (voir serveur_dnabert2/Dockerfile).
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+    restart: unless-stopped
+
+  biomistral:
+    build:
+      context: .
+      dockerfile: serveur_biomistral/Dockerfile
+    image: bioai-biomistral
+    expose:
+      - "8002"
+    environment:
+      <<: *internal-key
+      # Ollama tourne sur l'hôte, pas dans le compose : depuis un conteneur,
+      # "localhost" désigne le conteneur lui-même, d'où host.docker.internal.
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  gateway_data:

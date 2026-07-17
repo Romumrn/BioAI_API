@@ -1,5 +1,6 @@
-fastapi
-uvicorn
-pydantic
-requests
-python-dotenv
+# Ce serveur ne charge aucun modèle : il relaie vers Ollama ou vLLM.
+# Ni torch ni transformers, donc.
+fastapi==0.138.0
+uvicorn==0.49.0
+pydantic==2.13.4
+requests==2.34.2

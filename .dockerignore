@@ -1,0 +1,24 @@
+# Le contexte de build est la racine du repo (nécessaire pour COPY common/),
+# donc sans ce fichier chaque build enverrait ~2 Go de venvs au daemon.
+.venv*
+serveur_*/.venv*
+__pycache__/
+**/__pycache__/
+*.pyc
+
+.git/
+.gitignore
+.claude/
+
+# secrets et état d'exécution : jamais dans une image
+.env
+.internal_key
+tokens_db.json
+token.txt
+*.log
+
+# scripts de test/dev, inutiles dans les images
+serveur_*/test.py
+create_user.py
+start_all.py
+README.md

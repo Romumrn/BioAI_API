@@ -1,5 +1,5 @@
-fastapi
-uvicorn
-requests
-pydantic
-python-dotenv
+# Gateway : auth, quotas et routage. Aucun modèle chargé ici.
+fastapi==0.138.0
+uvicorn==0.49.0
+pydantic==2.13.4
+requests==2.34.2

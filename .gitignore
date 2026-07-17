@@ -6,5 +6,8 @@ venv/
 
 # clés API et bases de quota générées à l'exécution — jamais commit
 tokens_db.json
-service_keys.json
 token.txt
+.internal_key
+
+# secret du compose (.env.example est le modèle, lui est commité)
+.env

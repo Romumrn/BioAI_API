@@ -25,25 +25,17 @@ from common import (  # noqa: E402
 MODEL_NAME = "biomistral-7b"
 
 # BioMistral n'est pas chargé en mémoire ici : ce serveur ne fait que router
-# vers un backend qui, lui, sait le faire tourner. Deux backends supportés :
-#   - "ollama" : ollama pull cniongolo/biomistral (ou adrienbrault/biomistral-7b),
-#                puis ollama serve (par défaut sur localhost:11434)
-#   - "vllm"   : vllm serve BioMistral/BioMistral-7B --port 8000,
-#                qui expose déjà une API compatible OpenAI qu'on relaie telle quelle
-BACKEND = os.getenv("BIOMISTRAL_BACKEND", "ollama")  # "ollama" ou "vllm"
-
+# vers Ollama, qui le fait tourner (ollama pull cniongolo/biomistral, puis
+# ollama serve, par défaut sur localhost:11434).
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "cniongolo/biomistral")
-
-VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8000")
-VLLM_MODEL = os.getenv("VLLM_MODEL", "BioMistral/BioMistral-7B")
 
 # Fenêtre de contexte Ollama par défaut (OLLAMA_CONTEXT_LENGTH=4096). Au-delà,
 # le backend tronque silencieusement ou rame ; on plafonne max_tokens ici.
 MAX_TOKENS_LIMIT = 4096
 
 
-# ============ APPEL DU BACKEND (Ollama ou vLLM) ============
+# ============ APPEL DU BACKEND (Ollama) ============
 
 def call_ollama(prompt: str, max_tokens: int, temperature: float, top_p: float) -> Dict:
     """
@@ -90,69 +82,6 @@ def call_ollama(prompt: str, max_tokens: int, temperature: float, top_p: float) 
         "prompt_tokens": data.get("prompt_eval_count", 0),
         "completion_tokens": data.get("eval_count", 0),
     }
-
-
-def call_vllm(prompt: str, max_tokens: int, temperature: float, top_p: float) -> Dict:
-    """
-    Génère une complétion via l'API compatible OpenAI exposée par vLLM.
-
-    Args:
-        prompt: Texte d'entrée.
-        max_tokens: Nombre maximum de tokens à générer.
-        temperature: Température d'échantillonnage.
-        top_p: Top-p (nucleus sampling).
-
-    Returns:
-        Un dict avec les clés "text", "prompt_tokens" et "completion_tokens".
-
-    Raises:
-        HTTPException: 500 si l'appel à vLLM échoue.
-    """
-    try:
-        resp = requests.post(
-            f"{VLLM_BASE_URL}/v1/completions",
-            json={
-                "model": VLLM_MODEL,
-                "prompt": prompt,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-            },
-            timeout=300,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as e:
-        raise server_error(
-            f"vLLM backend unreachable ({VLLM_BASE_URL}): {e}",
-            code="backend_unavailable",
-        )
-
-    choice = data["choices"][0]
-    usage = data.get("usage", {})
-    return {
-        "text": choice.get("text", ""),
-        "prompt_tokens": usage.get("prompt_tokens", 0),
-        "completion_tokens": usage.get("completion_tokens", 0),
-    }
-
-
-def call_backend(prompt: str, max_tokens: int, temperature: float, top_p: float) -> Dict:
-    """
-    Dispatche l'appel de génération vers le backend configuré (BACKEND).
-
-    Args:
-        prompt: Texte d'entrée.
-        max_tokens: Nombre maximum de tokens à générer.
-        temperature: Température d'échantillonnage.
-        top_p: Top-p (nucleus sampling).
-
-    Returns:
-        Un dict avec les clés "text", "prompt_tokens" et "completion_tokens".
-    """
-    if BACKEND == "vllm":
-        return call_vllm(prompt, max_tokens, temperature, top_p)
-    return call_ollama(prompt, max_tokens, temperature, top_p)
 
 
 # ============ MODELS FASTAPI (format OpenAI) ============
@@ -217,7 +146,7 @@ def create_completion(request: CompletionRequest):
     total_completion_tokens = 0
 
     for i in range(request.n):
-        result = call_backend(
+        result = call_ollama(
             request.prompt, request.max_tokens, request.temperature, request.top_p
         )
         total_prompt_tokens += result["prompt_tokens"]
@@ -259,7 +188,7 @@ async def list_models():
                 "id": MODEL_NAME,
                 "object": "model",
                 "created": 0,
-                "owned_by": f"biomistral-via-{BACKEND}"
+                "owned_by": "biomistral-via-ollama"
             }
         ]
     }
@@ -274,14 +203,14 @@ async def health():
     pour attendre que le service soit prêt.
 
     Returns:
-        Un dict avec le statut, le nom du modèle, le backend utilisé
+        Un dict avec le statut, le nom du modèle, l'URL d'Ollama
         et un timestamp.
     """
     return {
         "status": "ok",
         "model": MODEL_NAME,
-        "backend": BACKEND,
-        "backend_url": OLLAMA_BASE_URL if BACKEND == "ollama" else VLLM_BASE_URL,
+        "backend": "ollama",
+        "backend_url": OLLAMA_BASE_URL,
         "timestamp": datetime.now().isoformat()
     }
 
@@ -298,7 +227,7 @@ async def root():
         "name": "BioMistral API",
         "version": "0.1.0",
         "model": MODEL_NAME,
-        "backend": BACKEND,
+        "backend": "ollama",
         "note": "Serveur interne : les utilisateurs passent par la gateway "
                 "(port 8080), qui gère les clés API et les quotas.",
         "endpoints": {

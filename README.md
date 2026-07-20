@@ -31,9 +31,19 @@ We're open to adding pretty much any model useful for bio/genomics, as long as w
 - **[Nucleotide Transformer](serveur_nucleotide_transformer/)** — unlike Evo, this one isn't generative: it's a BERT-style encoder that produces embeddings from DNA sequences, which can then be reused for classification or analysis. Exposed via `/v1/embeddings`.
 - **[GROVER](serveur_grover/)** — another BERT-style encoder, but trained only on the human genome, with a BPE tokenizer built to reflect the "grammar" of human DNA rather than a fixed k-mer size. Same idea as Nucleotide Transformer (embeddings out, downstream task after), exposed the same way via `/v1/embeddings`.
 - **[DNABERT-2](serveur_dnabert2/)** — a third BERT-style DNA encoder, but multi-species like Nucleotide Transformer, with its own BPE tokenizer (trained across 135 genomes) instead of GROVER's human-only one. Same `/v1/embeddings` shape as the other two, chosen specifically because it isn't redundant with them: different tokenization strategy, different species coverage, and a different loading path (`AutoModel`, not `AutoModelForMaskedLM`, since its custom modeling code doesn't register a masked-LM head — the embeddings server pulls the last hidden state directly from `outputs[0]` instead of using `output_hidden_states=True`).
-- **[BioMistral](serveur_biomistral/)** — a biomedical text LLM (Mistral fine-tuned on PubMed). We picked this one to test running through an external runtime: it runs via Ollama. BioMistral, on the other hand, works fine with it, so it's our test case for the "proxy to an external runtime" building block.
+- **[Med42-v2 8B](serveur_med42/)** — a biomedical chat LLM (Llama-3-8B-Instruct, instruction-tuned by M42 Health on a mix that explicitly includes open-domain dialogues, not just medical QA). We picked this slot to test running through an external runtime: it runs via Ollama.
 
 For futher information please visit: **[romumrn.github.io/slides_AI_DNA](https://romumrn.github.io/slides_AI_DNA)**. 
+
+### Why Med42, not BioMistral or OpenBioLLM
+
+The model on this slot changed twice before landing on Med42-v2. Not a preference call — each earlier pick turned out to be the wrong *kind* of model for a chat endpoint, discovered by actually talking to it:
+
+1. **BioMistral-7B** (`cniongolo/biomistral`, the first pick) is a plain continued-pretraining model: Mistral-7B-Instruct-v0.1 with extra pretraining on PubMed Central text, but no instruction or dialogue fine-tuning on top. It doesn't really hold a conversation — through `/v1/chat/completions`, flattening a multi-turn history into one prompt made it imitate the transcript's style rather than track state, so it would re-ask questions it had already asked.
+2. **OpenBioLLM-8B** (`koesn/llama3-openbiollm-8b`, the second pick) fixed that specific bug — it's Llama-3-8B-Instruct, DPO-tuned, and does hold conversational state once wired through Ollama's native `/api/chat`. But its DPO tuning leans heavily on medical QA *benchmarks* (MedQA, MedMCQA, PubMedQA — all multiple-choice question banks), not dialogue. It answers a precise question correctly, but given an open-ended prompt like "tell me more about cancer" it tends to emit a chain of benchmark-style questions instead of an answer — confirmed by testing the exact same prompt directly against Ollama, bypassing our gateway entirely, so it wasn't a bug in our code.
+3. **Med42-v2 8B** (`thewindmom/llama3-med42-8b`, current) is also Llama-3-8B-Instruct, but instruction-tuned by M42 Health on a dataset that explicitly includes open-domain dialogues alongside medical QA. Same prompt that broke OpenBioLLM gets a real, structured answer.
+
+One unrelated bug surfaced along the way and is fixed independently of which model is loaded: the OpenBioLLM GGUF package had a corrupted stop-token declaration in its Modelfile (`"<|eot_id|>"` with literal quote characters baked in, instead of `<|eot_id|>`), so Ollama never recognized the real Llama-3 end-of-turn token and generation would drift into incoherent text past the actual answer. `serveur_med42/med42_server.py` now forces the correct stop tokens on every call rather than trusting whatever a given Ollama package declares — harmless when the package is packaged correctly, a real fix when it isn't.
 
 ## Repo structure
 
@@ -47,7 +57,7 @@ start_all.py                      # bare-metal launcher (model servers + gateway
 create_user.py                    # creates an API key on the gateway, saves it to token.txt
 serveur_evo/                      # Evo — DNA sequence generation (port 8000, internal)
 serveur_nucleotide_transformer/   # Nucleotide Transformer — DNA embeddings (port 8001, internal)
-serveur_biomistral/               # BioMistral — biomedical text, via Ollama/vLLM (port 8002, internal)
+serveur_med42/                    # Med42-v2 8B — biomedical chat, via Ollama (port 8002, internal)
 serveur_grover/                   # GROVER — DNA embeddings (port 8003, internal)
 serveur_dnabert2/                 # DNABERT-2 — DNA embeddings, multi-species (port 8004, internal)
 ```
@@ -68,7 +78,7 @@ Inside each model folder:
 
 ## Starting everything at once (Docker — the normal way)
 
-The five models don't agree on much: Evo wants `transformers` 5.2 and `evo-model`, Nucleotide Transformer needs `transformers` <5 for its remote code, DNABERT-2 runs on Python 3.13 with a **CPU** build of torch, and BioMistral needs no torch at all. Each server gets its own image, so none of this leaks into your shell environment.
+The five models don't agree on much: Evo wants `transformers` 5.2 and `evo-model`, Nucleotide Transformer needs `transformers` <5 for its remote code, DNABERT-2 runs on Python 3.13 with a **CPU** build of torch, and Med42 (via Ollama) needs no torch at all. Each server gets its own image, so none of this leaks into your shell environment.
 
 ```bash
 # one-time: generate the two secrets (internal + admin)
@@ -96,7 +106,7 @@ The gateway publishes on `127.0.0.1:8080`, not `0.0.0.0`. It's meant to sit behi
 
 Two things the compose file expects from the host:
 
-- **Ollama**, for BioMistral — that server is a proxy, it loads nothing itself. The container reaches the host's Ollama through `host.docker.internal`, so `ollama serve` must be up with the model pulled (`ollama pull cniongolo/biomistral`). Ollama's default bind is `127.0.0.1`, which no container can reach, so it has to listen wider:
+- **Ollama**, for Med42 — that server is a proxy, it loads nothing itself. The container reaches the host's Ollama through `host.docker.internal`, so `ollama serve` must be up with the model pulled (`ollama pull thewindmom/llama3-med42-8b`). Ollama's default bind is `127.0.0.1`, which no container can reach, so it has to listen wider:
 
   ```bash
   OLLAMA_HOST=0.0.0.0 ollama serve
@@ -131,7 +141,7 @@ A model server no longer accepts user keys, so testing one still goes through th
 ```bash
 cd serveur_evo  # or one of the other folders
 pip install -r requirement.txt
-python evo_server.py       # or nt_server.py / biomistral_server.py / grover_server.py
+python evo_server.py       # or nt_server.py / med42_server.py / grover_server.py
 # in another shell, from the repo root:
 python gateway.py
 python create_user.py      # creates a key on the gateway, saved to token.txt
@@ -170,9 +180,10 @@ So the public base URL is **`https://prabi-cloud149.univ-lyon1.fr/bioai/`** — 
 
 [OpenGateLLM](https://github.com/etalab-ia/OpenGateLLM) is an LLM gateway that can put this API behind its own routing, quotas and accounting. It talks to us as a plain OpenAI-compatible provider.
 
-**Why `/v1/chat/completions` exists.** OpenGateLLM's provider client has exactly one entry for generation: `/v1/chat/completions`. The legacy `/v1/completions` format our model servers speak isn't in its endpoint table at all. So the gateway grows a `/v1/chat/completions` that flattens `messages` into a `prompt`, forwards to `/v1/completions`, and converts the answer back. Without it, only the embeddings models would be pluggable.
+**Why `/v1/chat/completions` exists.** OpenGateLLM's provider client has exactly one entry for generation: `/v1/chat/completions`. The legacy `/v1/completions` format our model servers speak isn't in its endpoint table at all. So the gateway grows a `/v1/chat/completions` — routed one of two ways depending on the backend (see `chat_capable` in `gateway.py`'s `BACKENDS`):
 
-The flattening treats a lone user message as a raw prompt, deliberately: Evo is a **DNA** model, and wrapping a sequence in `User:` / `Assistant:` would make it continue an English conversation instead of the sequence — answering wrong rather than failing loudly. Multi-turn conversations only make sense for BioMistral, and get a labelled transcript.
+- **Evo** (not chat-capable): `messages` is flattened into a `prompt`, forwarded to `/v1/completions`, and the answer converted back. The flattening treats a lone user message as a raw prompt, deliberately: Evo is a **DNA** model, and wrapping a sequence in `User:` / `Assistant:` would make it continue an English conversation instead of the sequence — answering wrong rather than failing loudly.
+- **Med42** (`chat_capable: true`): `messages` is forwarded as-is to the model server's own `/v1/chat/completions`, which relays it to Ollama's native `/api/chat`. This one matters: flattening a multi-turn conversation into a single prompt broke the model's ability to track state (it would re-ask questions it had already asked) — Ollama's chat endpoint applies the model's real per-turn template instead.
 
 `stream: true` is honoured, but it's emulated: no model server here streams, so the whole answer arrives in one SSE chunk after full generation. It exists because OpenGateLLM's playground asks for streaming by default.
 
@@ -187,7 +198,7 @@ Then, one router (model) per model, each with one provider of type `openai`:
 ```yaml
 models:
   - name: nucleotide-transformer-v2-100m-multi-species
-    type: text-embeddings-inference     # text-generation for evo / biomistral
+    type: text-embeddings-inference     # text-generation for evo / med42
     providers:
       - type: openai
         url: https://prabi-cloud149.univ-lyon1.fr/bioai/
@@ -198,7 +209,7 @@ models:
 | Model | OpenGateLLM router `type` |
 |---|---|
 | `nucleotide-transformer-v2-100m-multi-species`, `grover`, `dnabert2-117m` | `text-embeddings-inference` |
-| `evo-1.5-8k-base`, `biomistral-7b` | `text-generation` |
+| `evo-1.5-8k-base`, `med42-8b` | `text-generation` |
 
 Three things worth knowing, each of which cost an afternoon to find out:
 

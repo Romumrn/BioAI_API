@@ -1,5 +1,5 @@
 """
-Test rapide de biomistral-7b à travers la gateway.
+Test rapide de med42-8b à travers la gateway.
 
 La clé API est celle de la gateway (voir create_user.py à la racine) : elle
 donne accès à tous les modèles, c'est le champ "model" ci-dessous qui choisit
@@ -14,7 +14,7 @@ from pathlib import Path
 import requests
 
 GATEWAY_URL = "http://localhost:8080"
-MODEL = "biomistral-7b"
+MODEL = "med42-8b"
 
 # token.txt vit à la racine du repo, créé par create_user.py
 TOKEN_FILE = Path(__file__).resolve().parent.parent / "token.txt"

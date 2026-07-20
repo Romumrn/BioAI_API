@@ -60,10 +60,17 @@ BACKENDS = {
         "kind": "embeddings",
         "owned_by": "instadeep",
     },
-    "biomistral-7b": {
-        "url": backend_url("biomistral", 8002),
+    "med42-8b": {
+        "url": backend_url("med42", 8002),
         "kind": "completions",
-        "owned_by": "biomistral",
+        "owned_by": "m42-health",
+        # Contrairement à Evo (séquences ADN brutes, pas de notion de chat),
+        # ce serveur expose un vrai /v1/chat/completions qui relaie
+        # l'historique structuré à Ollama. /v1/chat/completions de la gateway
+        # le lui transmet donc tel quel plutôt que de l'aplatir en prompt —
+        # l'aplatissement casse la tenue de conversation du modèle (voir
+        # serveur_med42/med42_server.py:call_ollama_chat).
+        "chat_capable": True,
     },
     "grover": {
         "url": backend_url("grover", 8003),
@@ -208,6 +215,7 @@ def handle_request(
     authorization: Optional[str],
     payload: dict,
     kind: str,
+    path: Optional[str] = None,
 ) -> dict:
     """
     Chaîne complète d'une requête modèle : authentification de l'utilisateur,
@@ -219,7 +227,11 @@ def handle_request(
     Args:
         authorization: Header Authorization au format "Bearer <api_key>".
         payload: Corps JSON de la requête, relayé tel quel.
-        kind: Type d'endpoint ("completions" ou "embeddings").
+        kind: Type d'endpoint ("completions" ou "embeddings"), utilisé pour
+            résoudre le backend et le seuil de quota minimum.
+        path: Chemin à appeler sur le serveur de modèle, si différent de
+            f"/v1/{kind}" — cas de /v1/chat/completions sur un backend
+            chat_capable (voir create_chat_completion).
 
     Returns:
         Le corps JSON de la réponse du serveur de modèle.
@@ -235,7 +247,7 @@ def handle_request(
     if remaining is not None and remaining < MIN_REMAINING[kind]:
         raise insufficient_quota(f"Quota exceeded. Remaining tokens: {remaining}")
 
-    data = forward(backend, f"/v1/{kind}", payload)
+    data = forward(backend, path or f"/v1/{kind}", payload)
 
     tokens_used = data.get("usage", {}).get("total_tokens", 0)
     if not token_manager.deduct_tokens(api_key, tokens_used):
@@ -246,12 +258,14 @@ def handle_request(
 
 # ============ TRADUCTION CHAT <-> COMPLETIONS ============
 #
-# Nos serveurs de modèles ne parlent que le format "completions" historique
-# (un prompt, du texte en sortie). OpenGateLLM, lui, ne sait appeler qu'un
-# /v1/chat/completions pour tout modèle de type text-generation : son client
-# provider n'a aucune entrée pour les completions legacy. Cette traduction est
-# donc ce qui rend evo et biomistral branchables — sans elle, seuls les
-# modèles d'embeddings le sont.
+# OpenGateLLM ne sait appeler qu'un /v1/chat/completions pour tout modèle de
+# type text-generation : son client provider n'a aucune entrée pour les
+# completions legacy. Nos serveurs de modèles qui n'ont pas de notion de chat
+# (Evo : séquences ADN brutes) ne parlent que le format "completions"
+# historique — cette traduction est ce qui les rend branchables malgré tout.
+# Med42, lui, expose un vrai /v1/chat/completions (voir "chat_capable" dans
+# BACKENDS) et n'a pas besoin de cette traduction : l'aplatissement en prompt
+# casserait sa tenue de conversation à plusieurs tours.
 
 ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant"}
 
@@ -260,13 +274,14 @@ def messages_to_prompt(messages: List[Dict]) -> str:
     """
     Aplatit une liste de messages de chat en un prompt unique.
 
-    Le cas d'un seul message utilisateur est traité à part, et ce n'est pas
-    une optimisation : evo est un modèle d'ADN, à qui l'on envoie une séquence
-    brute. Le préfixer d'un "User:" et le suivre d'un "Assistant:" lui ferait
-    continuer une conversation en anglais au lieu de la séquence — le modèle
-    répondrait à côté au lieu d'échouer franchement. Une conversation à
-    plusieurs tours n'a de sens que pour biomistral, et prend alors la forme
-    d'une transcription étiquetée.
+    Cette fonction n'est plus appelée que pour Evo (le seul backend qui ne
+    soit pas "chat_capable", voir BACKENDS) : Med42 reçoit désormais son
+    historique de messages tel quel, non aplati. Le cas d'un seul message
+    utilisateur est traité à part, et ce n'est pas une optimisation : evo est
+    un modèle d'ADN, à qui l'on envoie une séquence brute. Le préfixer d'un
+    "User:" et le suivre d'un "Assistant:" lui ferait continuer une
+    conversation en anglais au lieu de la séquence — le modèle répondrait à
+    côté au lieu d'échouer franchement.
 
     Args:
         messages: Liste de messages au format OpenAI ({"role", "content"}).
@@ -428,7 +443,7 @@ app = FastAPI(
     title="BioAI Gateway",
     description="Point d'entrée unique : authentification et routage vers les "
                 "serveurs de modèles bio-informatique (Evo, Nucleotide Transformer, "
-                "BioMistral...)",
+                "Med42...)",
     version="0.1.0"
 )
 
@@ -469,9 +484,12 @@ async def create_chat_completion(request: Request, authorization: str = Header(N
     """
     Génère une réponse de chat (format OpenAI), routée vers le bon modèle.
 
-    Endpoint de compatibilité : il traduit le format chat vers le format
-    completions que parlent nos serveurs de modèles, et retraduit la réponse.
-    C'est le seul format de génération qu'OpenGateLLM sache appeler.
+    C'est le seul format de génération qu'OpenGateLLM sache appeler. Deux
+    chemins selon le backend visé :
+      - "chat_capable" (Med42) : les messages sont relayés tels quels,
+        le serveur de modèle tient lui-même la conversation.
+      - sinon (Evo) : traduit vers le format completions que parle le
+        serveur, et retraduit la réponse — voir chat_to_completion_payload.
 
     Args:
         request: Requête brute au format chat (messages, max_tokens, stream...).
@@ -489,10 +507,22 @@ async def create_chat_completion(request: Request, authorization: str = Header(N
     payload = await parse_payload(request)
     stream = bool(payload.get("stream", False))
 
-    data = handle_request(
-        authorization, chat_to_completion_payload(payload), kind="completions"
-    )
-    chat = completion_to_chat(data)
+    backend = resolve_backend(payload.get("model"), expected_kind="completions")
+
+    if backend.get("chat_capable"):
+        forward_payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in ("stream", "stream_options") and value is not None
+        }
+        chat = handle_request(
+            authorization, forward_payload, kind="completions", path="/v1/chat/completions"
+        )
+    else:
+        data = handle_request(
+            authorization, chat_to_completion_payload(payload), kind="completions"
+        )
+        chat = completion_to_chat(data)
 
     if stream:
         return StreamingResponse(chat_to_sse(chat), media_type="text/event-stream")

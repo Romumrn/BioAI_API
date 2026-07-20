@@ -57,7 +57,7 @@ services:
       BIOAI_TOKENS_FILE: /data/tokens_db.json
       BIOAI_EVO_URL: http://evo:8000
       BIOAI_NT_URL: http://nt:8001
-      BIOAI_BIOMISTRAL_URL: http://biomistral:8002
+      BIOAI_MED42_URL: http://med42:8002
       BIOAI_GROVER_URL: http://grover:8003
       BIOAI_DNABERT2_URL: http://dnabert2:8004
     volumes:
@@ -68,7 +68,7 @@ services:
         condition: service_healthy
       nt:
         condition: service_healthy
-      biomistral:
+      med42:
         condition: service_healthy
       grover:
         condition: service_healthy
@@ -155,11 +155,11 @@ services:
       start_period: 300s
     restart: unless-stopped
 
-  biomistral:
+  med42:
     build:
       context: .
-      dockerfile: serveur_biomistral/Dockerfile
-    image: bioai-biomistral
+      dockerfile: serveur_med42/Dockerfile
+    image: bioai-med42
     expose:
       - "8002"
     environment:

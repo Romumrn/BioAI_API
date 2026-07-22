@@ -1,0 +1,4 @@
+# Dépendances de test uniquement (gateway + common), en plus de requirement.txt.
+-r requirement.txt
+pytest==8.3.5
+httpx==0.28.1
